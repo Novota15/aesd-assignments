@@ -118,10 +118,24 @@ int main(int argc, char *argv[]) {
         syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(((struct sockaddr_in*)&their_addr)->sin_addr));
 
         ssize_t num_read;
-        while((num_read = read(client_socket_fd, buffer, buffer_size - 1)) > 0) {
-            buffer[num_read] = '\0'; // Null-terminate the string
-            fputs(buffer, output_file); // Append buffer to the file
-            fflush(output_file); // Ensure data is written to disk
+        ssize_t total_read = 0; // Track total amount of data read in the current packet.
+
+        while((num_read = read(client_socket_fd, buffer + total_read, buffer_size - 1 - total_read)) > 0) {
+            total_read += num_read; // Update total amount of data read.
+            buffer[total_read] = '\0'; // Null-terminate the string for safe processing.
+
+            // Check if we have received a complete packet (i.e., data ending with a newline).
+            char *newline = strchr(buffer, '\n');
+            if (newline != NULL) {
+                *newline = '\0'; // Replace newline with null-terminator to treat as a complete string.
+                fputs(buffer, output_file); // Write the complete packet to the file.
+                fputc('\n', output_file); // Add back the newline character.
+                fflush(output_file); // Ensure data is written to disk.
+
+                // Prepare for the next packet.
+                memmove(buffer, newline + 1, total_read - (newline + 1 - buffer));
+                total_read -= (newline + 1 - buffer);
+            }
         }
 
         fclose(output_file); // Close the file to ensure data is flushed
@@ -129,8 +143,9 @@ int main(int argc, char *argv[]) {
         if(num_read == -1 && errno != EWOULDBLOCK) {
             perror("read");
             close(client_socket_fd);
-            continue; // Move to next client or exit if signal received
+            continue; // Move to next client or exit if signal received.
         }
+        
 
         // Reopen the file for reading before sending its contents
         output_file = fopen(output_filename, "r");
@@ -151,7 +166,7 @@ int main(int argc, char *argv[]) {
         if (!output_file) {
             handle_error("Failed to reopen output file for appending");
         }
-        
+
         // Close client socket and log closure
         close(client_socket_fd);
         syslog(LOG_INFO, "Closed connection from %s", inet_ntoa(((struct sockaddr_in*)&their_addr)->sin_addr));
