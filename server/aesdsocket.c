@@ -124,19 +124,34 @@ int main(int argc, char *argv[]) {
             fflush(output_file); // Ensure data is written to disk
         }
 
+        fclose(output_file); // Close the file to ensure data is flushed
+
         if(num_read == -1 && errno != EWOULDBLOCK) {
             perror("read");
             close(client_socket_fd);
             continue; // Move to next client or exit if signal received
         }
 
+        // Reopen the file for reading before sending its contents
+        output_file = fopen(output_filename, "r");
+        if (!output_file) {
+            handle_error("Failed to open output file for reading");
+        }
+
         // Send back the file's content to the client
-        fseek(output_file, 0, SEEK_SET); // Go to the beginning of the file
+        fseek(output_file, 0, SEEK_SET); // Ensure we're at the start of the file
         while((num_read = fread(buffer, 1, buffer_size - 1, output_file)) > 0) {
             send(client_socket_fd, buffer, num_read, 0);
         }
 
+        fclose(output_file); // Close the file after sending its content
 
+        // Reopen the file for appending for the next write operation
+        output_file = fopen(output_filename, "a+");
+        if (!output_file) {
+            handle_error("Failed to reopen output file for appending");
+        }
+        
         // Close client socket and log closure
         close(client_socket_fd);
         syslog(LOG_INFO, "Closed connection from %s", inet_ntoa(((struct sockaddr_in*)&their_addr)->sin_addr));
