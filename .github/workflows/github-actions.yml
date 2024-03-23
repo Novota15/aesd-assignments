@@ -17,16 +17,16 @@ jobs:
             run: chmod +x *.sh
           - name: Run unit test
             run: ./unit-test.sh
-    # will add support for full test in part 2
-    # full-test:
-    #     # container: cuaesd/aesd-autotest:assignment1
-    #     container: cuaesd/aesd-autotest:assignment2
-    #     runs-on: ubuntu-latest
-    #     steps:
-    #       - uses: actions/checkout@v2
-    #       - name: Checkout submodules
-    #         run : git submodule update --init --recursive
-    #       - name: Set permissions for scripts
-    #         run: chmod +x *.sh
-    #       - name: Run full test
-    #         run: ./full-test.sh
+    full-test:
+        # container: cuaesd/aesd-autotest:assignment1
+        # container: cuaesd/aesd-autotest:assignment2
+        container: cuaesd/aesd-autotest:assignment3
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v2
+          - name: Checkout submodules
+            run : git submodule update --init --recursive
+          - name: Set permissions for scripts
+            run: chmod +x *.sh
+          - name: Run full test
+            run: ./full-test.sh
