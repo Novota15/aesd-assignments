@@ -1,6 +1,7 @@
 #!/bin/bash
 # Script outline to install and build kernel.
 # Author: Siddhant Jajoo.
+# Updated by Grant Novota
 
 set -e
 set -u
@@ -35,6 +36,10 @@ if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
     git checkout ${KERNEL_VERSION}
 
     # TODO: Add your kernel build steps here
+    make -j 8 ARCH=$ARCH CROSS_COMPILE=${CROSS_COMPILE} mrproper
+    make -j 8 ARCH=$ARCH CROSS_COMPILE=${CROSS_COMPILE} defconfig
+    make -j 8 ARCH=$ARCH CROSS_COMPILE=${CROSS_COMPILE} dtbs
+    make -j 8 ARCH=$ARCH CROSS_COMPILE=${CROSS_COMPILE} all
 fi
 
 echo "Adding the Image in outdir"
@@ -56,11 +61,16 @@ git clone git://busybox.net/busybox.git
     cd busybox
     git checkout ${BUSYBOX_VERSION}
     # TODO:  Configure busybox
+    git switch -c ${BUSYBOX_VERSION}
 else
     cd busybox
 fi
 
 # TODO: Make and install busybox
+make distclean
+make defconfig
+make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE}
+make CONFIG_PREFIX=${OUTDIR}/rootfs ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} install
 
 echo "Library dependencies"
 ${CROSS_COMPILE}readelf -a bin/busybox | grep "program interpreter"
@@ -78,3 +88,36 @@ ${CROSS_COMPILE}readelf -a bin/busybox | grep "Shared library"
 # TODO: Chown the root directory
 
 # TODO: Create initramfs.cpio.gz
+
+export SYSROOT=$(${CROSS_COMPILE}gcc -print-sysroot)
+cp -a $SYSROOT/lib/ld-linux-aarch64.so.1 lib
+cp -a $SYSROOT/lib64/ld-2.31.so lib64
+cp -a $SYSROOT/lib64/libm.so.6 lib64
+cp -a $SYSROOT/lib64/libm-2.31.so lib64
+cp -a $SYSROOT/lib64/libresolv.so.2 lib64
+cp -a $SYSROOT/lib64/libresolv-2.31.so lib64
+cp -a $SYSROOT/lib64/libc.so.6 lib64
+cp -a $SYSROOT/lib64/libc-2.31.so lib64
+
+cd $CURRENT_DIR
+make clean
+make arm
+
+cp finder.sh $OUTDIR/rootfs/home
+cp finder-test.sh $OUTDIR/rootfs/home
+cp writer $OUTDIR/rootfs/home
+cp writer.sh $OUTDIR/rootfs/home
+cp autorun-qemu.sh $OUTDIR/rootfs/home
+cp -r conf/ ${OUTDIR}/rootfs/home
+cp -r conf/ ${OUTDIR}/rootfs/
+
+cd ${OUTDIR}/rootfs
+sudo mknod -m 666 dev/null c 1 3
+sudo mknod -m 600 dev/console c 5 1
+
+cd ${OUTDIR}/rootfs
+sudo chown -R root:root *
+
+find . | cpio -H newc -ov --owner root:root > ../initramfs.cpio
+cd ..
+gzip initramfs.cpio
