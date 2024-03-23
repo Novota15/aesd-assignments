@@ -115,4 +115,48 @@ int main(int argc, char *argv[]) {
         }
 
         // Log accepted connection
-        syslog(LOG_INFO,
+        syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(((struct sockaddr_in*)&their_addr)->sin_addr));
+
+        ssize_t num_read;
+        while((num_read = read(client_socket_fd, buffer, buffer_size - 1)) > 0) {
+            buffer[num_read] = '\0'; // Null-terminate the string
+            fputs(buffer, output_file); // Append buffer to the file
+            fflush(output_file); // Ensure data is written to disk
+        }
+
+        if(num_read == -1 && errno != EWOULDBLOCK) {
+            perror("read");
+            close(client_socket_fd);
+            continue; // Move to next client or exit if signal received
+        }
+
+        // Send back the file's content to the client
+        fseek(output_file, 0, SEEK_SET); // Go to the beginning of the file
+        while((num_read = fread(buffer, 1, buffer_size - 1, output_file)) > 0) {
+            send(client_socket_fd, buffer, num_read, 0);
+        }
+
+
+        // Close client socket and log closure
+        close(client_socket_fd);
+        syslog(LOG_INFO, "Closed connection from %s", inet_ntoa(((struct sockaddr_in*)&their_addr)->sin_addr));
+    } // While keep_running loop ends here
+
+    // Clean up before exiting
+    printf("Freeing allocated memory and closing file descriptors\n");
+    free(buffer);
+    fclose(output_file);
+    close(server_socket_fd);
+
+    // Delete the file as part of graceful shutdown
+    if(remove(output_filename) == 0) {
+        printf("Deleted the file: %s\n", output_filename);
+    } else {
+        perror("Failed to delete the file");
+    }
+
+    // Closing syslog
+    closelog();
+
+    return 0; 
+}
