@@ -117,6 +117,8 @@ int main(int argc, char *argv[]) {
         // Log accepted connection
         syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(((struct sockaddr_in*)&their_addr)->sin_addr));
 
+        // Initialize a temporary buffer for reading data.
+        char temp_buffer[buffer_size];
         ssize_t num_read;
         ssize_t total_read = 0; // Track total amount of data read in the current packet.
 
