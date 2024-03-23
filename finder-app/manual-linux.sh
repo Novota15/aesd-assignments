@@ -81,6 +81,9 @@ make CONFIG_PREFIX=${OUTDIR}/rootfs ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} 
 
 echo "Library dependencies"
 cd ${OUTDIR}/rootfs
+# Create lib and lib64 directories if they don't exist
+mkdir -p lib lib64
+
 ${CROSS_COMPILE}readelf -a bin/busybox | grep "program interpreter"
 ${CROSS_COMPILE}readelf -a bin/busybox | grep "Shared library"
 
@@ -98,14 +101,14 @@ ${CROSS_COMPILE}readelf -a bin/busybox | grep "Shared library"
 # TODO: Create initramfs.cpio.gz
 
 export SYSROOT=$(${CROSS_COMPILE}gcc -print-sysroot)
-cp -a $SYSROOT/lib/ld-linux-aarch64.so.1 lib
-cp -a $SYSROOT/lib64/ld-2.31.so lib64
-cp -a $SYSROOT/lib64/libm.so.6 lib64
-cp -a $SYSROOT/lib64/libm-2.31.so lib64
-cp -a $SYSROOT/lib64/libresolv.so.2 lib64
-cp -a $SYSROOT/lib64/libresolv-2.31.so lib64
-cp -a $SYSROOT/lib64/libc.so.6 lib64
-cp -a $SYSROOT/lib64/libc-2.31.so lib64
+cp -a $SYSROOT/lib/ld-linux-aarch64.so.1 lib/
+cp -a $SYSROOT/lib64/ld-2.31.so lib64/
+cp -a $SYSROOT/lib64/libm.so.6 lib64/
+cp -a $SYSROOT/lib64/libm-2.31.so lib64/
+cp -a $SYSROOT/lib64/libresolv.so.2 lib64/
+cp -a $SYSROOT/lib64/libresolv-2.31.so lib64/
+cp -a $SYSROOT/lib64/libc.so.6 lib64/
+cp -a $SYSROOT/lib64/libc-2.31.so lib64/
 
 cd $CURRENT_DIR
 make clean
