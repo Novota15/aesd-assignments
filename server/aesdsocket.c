@@ -120,24 +120,25 @@ int main(int argc, char *argv[]) {
         // Initialize a temporary buffer for reading data.
         char temp_buffer[buffer_size];
         ssize_t num_read;
-        ssize_t total_read = 0; // Track total amount of data read in the current packet.
 
-        while((num_read = read(client_socket_fd, buffer + total_read, buffer_size - 1 - total_read)) > 0) {
-            total_read += num_read; // Update total amount of data read.
-            buffer[total_read] = '\0'; // Null-terminate the string for safe processing.
+        while((num_read = read(client_socket_fd, temp_buffer, sizeof(temp_buffer) - 1)) > 0) {
+            temp_buffer[num_read] = '\0'; // Null-terminate the received chunk.
+            char *token = strtok(temp_buffer, "\n");
 
-            // Check if we have received a complete packet (i.e., data ending with a newline).
-            char *newline = strchr(buffer, '\n');
-            if (newline != NULL) {
-                *newline = '\0'; // Replace newline with null-terminator to treat as a complete string.
-                fputs(buffer, output_file); // Write the complete packet to the file.
-                fputc('\n', output_file); // Add back the newline character.
-                fflush(output_file); // Ensure data is written to disk.
-
-                // Prepare for the next packet.
-                memmove(buffer, newline + 1, total_read - (newline + 1 - buffer));
-                total_read -= (newline + 1 - buffer);
+            while(token != NULL) {
+                // Process each token/packet.
+                fputs(token, output_file); // Append the packet to the file.
+                fputc('\n', output_file); // Ensure newline is preserved.
+                token = strtok(NULL, "\n"); // Move to the next packet.
             }
+            fflush(output_file); // Flush after all packets in the buffer are processed.
+
+            // Send the file's content back to the client here, outside the inner loop.
+            rewind(output_file); // Reset to the beginning of the file.
+            while((num_read = fread(buffer, 1, buffer_size - 1, output_file)) > 0) {
+                send(client_socket_fd, buffer, num_read, 0); // Send file content.
+            }
+            rewind(output_file); // Reset for the next operation.
         }
 
         fclose(output_file); // Close the file to ensure data is flushed
