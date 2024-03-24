@@ -3,211 +3,241 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/queue.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <syslog.h>
 #include <unistd.h>
-#include <pthread.h>
 
 #define handle_error(msg) \
-  do { perror(msg); exit(EXIT_FAILURE); } while (0)
+  do {                    \
+    perror(msg);          \
+    exit(EXIT_FAILURE);   \
+  } while (0)
 
-volatile sig_atomic_t keep_running = 1;
+// Global flag to keep track of the application status
+volatile int keep_running = 1;
 const char *output_filename = "/var/tmp/aesdsocketdata";
-pthread_mutex_t write_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Mutex for task list and condition variable for queue management
+pthread_mutex_t list_mutex;
+pthread_cond_t queue_condition;
 
-// Improved signal handler function to gracefully finish execution
-void signal_handler(int sig) {
-    keep_running = 0;
+// Signal handler to gracefully shut down the server
+void finish() {
+  keep_running = 0;
+  syslog(LOG_NOTICE, "Caught signal, exiting");
 }
 
-void* handle_connection(void* arg) {
-    int client_socket_fd = *((int*)arg);
-    free(arg); // Free the dynamically allocated memory for the file descriptor.
+// Task structure to pass to worker threads
+typedef struct Task {
+  pthread_mutex_t *writing_output_mutex;
+  FILE *output_file;
+  int client_socket_fd;
+  int id;
+} Task;
 
-    char *buffer = calloc(1024 * 1024, sizeof(char)); // 1MB buffer.
-    if (buffer == NULL) {
-        handle_error("memory allocation failed");
-    }
+// Thread structure for managing worker threads in a singly linked list
+struct thread {
+  pthread_t id;
+  Task task;
+  SLIST_ENTRY(thread) threads;
+};
 
-    pthread_mutex_lock(&write_mutex);
-    FILE *output_file = fopen(output_filename, "a+");
-    if (!output_file) {
-        pthread_mutex_unlock(&write_mutex);
-        free(buffer);
-        close(client_socket_fd);
-        handle_error("Failed to open output file");
-    }
+// Define the head for the singly linked list of threads
+SLIST_HEAD(head_s, thread) head;
 
-    ssize_t num_read;
-    while((num_read = read(client_socket_fd, buffer, 1024 * 1024 - 1)) > 0) {
-        buffer[num_read] = '\0';
-        fputs(buffer, output_file);
-        fflush(output_file);
-    }
+// Function to execute the task assigned to a worker thread
+void execute_task(Task *task) {
+  // Allocate a buffer for reading from the socket
+  int thread_buffer_size = 10 * 1024 * 1024; // 10MB
+  char *thread_buffer = calloc(thread_buffer_size, sizeof(char));
+  if (thread_buffer == NULL) {
+    handle_error("calloc");
+  }
 
-    fclose(output_file); // Close the output file after writing
+  // Read from the client socket
+  ssize_t valread = read(task->client_socket_fd, thread_buffer, thread_buffer_size - 1);
+  thread_buffer[valread] = '\0'; // Null-terminate the received data
 
-    // Reopen the file to send its content back to the client.
-    FILE* read_file = fopen(output_filename, "r");
-    if (!read_file) {
-        syslog(LOG_ERR, "Failed to open file for reading: %s", output_filename);
-        pthread_mutex_unlock(&write_mutex);
-        close(client_socket_fd);
-        free(buffer);
-        return NULL; // Exit the thread function properly
-    }
+  // Lock the mutex before writing to the shared output file
+  pthread_mutex_lock(task->writing_output_mutex);
 
-    char read_buffer[1024];
-    size_t bytes_read;
-    while ((bytes_read = fread(read_buffer, 1, sizeof(read_buffer), read_file)) > 0) {
-        send(client_socket_fd, read_buffer, bytes_read, 0); // Looping until all bytes are sent is advised
-    }
+  // Move to the end of the file and write the received data
+  fseek(task->output_file, 0, SEEK_END);
+  char *tok = strtok(thread_buffer, "\n");
+  while (tok != NULL) {
+    fprintf(task->output_file, "%s\n", tok);
+    tok = strtok(NULL, "\n");
+  }
 
-    fclose(read_file);
-    pthread_mutex_unlock(&write_mutex);
+  // Reallocate the buffer if the file size is greater than the buffer size
+  long file_size = ftell(task->output_file);
+  if (file_size > thread_buffer_size) {
+    thread_buffer_size = file_size * 2;
+    thread_buffer = realloc(thread_buffer, thread_buffer_size);
+  }
 
-    close(client_socket_fd);
-    free(buffer);
-    return NULL;
+  // Read the entire file content into the buffer
+  rewind(task->output_file);
+  fread(thread_buffer, file_size, 1, task->output_file);
+  thread_buffer[file_size] = '\0';
+  fseek(task->output_file, 0, SEEK_END);
+
+  // Unlock the mutex after writing
+  pthread_mutex_unlock(task->writing_output_mutex);
+
+  // Send the file content back to the client and close the socket
+  send(task->client_socket_fd, thread_buffer, file_size, 0);
+  close(task->client_socket_fd);
+
+  // Clean up allocated resources
+  free(thread_buffer);
 }
 
+// Worker thread starting function
+void *start_thread(void *args) {
+  struct thread *th = (struct thread *)args;
+  execute_task(&th->task);
+  return NULL;
+}
 
-int main(int argc, char *argv[]) {
-    struct sockaddr_in server_address = {0};
-    int server_socket_fd;
-    struct sockaddr_storage their_addr; // Connector's address information
+// Timestamp thread function to add timestamps to the file every 10 seconds
+void *timestamp_thread(void *args) {
+  Task *task = (Task *)args;
+
+  while (keep_running) {
+    // Wait for 10 seconds
+    for (int i = 0; i < 10 && keep_running == 1; i++) {
+      sleep(1);
+    }
+    if (!keep_running) {
+      break;
+    }
+
+    // Generate a timestamp string
+    char s[100];
+    time_t t = time(NULL);
+    struct tm *tmp = localtime(&t);
+    strftime(s, sizeof(s), "%Y-%m-%d %H:%M:%S", tmp);
+
+    // Lock the mutex and write the timestamp to the file
+    pthread_mutex_lock(task->writing_output_mutex);
+    fprintf(task->output_file, "timestamp:%s\n", s);
+    pthread_mutex_unlock(task->writing_output_mutex);
+  }
+  return NULL;
+}
+
+int main(int argc, char **argv) {
+  int is_daemon = 0;
+  for (int i = 1; i < argc; i++) {
+    if (strncmp(argv[i], "-d", 2) == 0) {
+      is_daemon = 1;
+      break;
+    }
+  }
+
+  // Setup signal handling for graceful shutdown
+  signal(SIGINT, finish);
+  signal(SIGTERM, finish);
+
+  // Open or create the file where data will be appended
+  FILE *output_file = fopen(output_filename, "a+");
+  if (!output_file) {
+    handle_error("Failed to open output file");
+  }
+
+  // Initialize server socket
+  int server_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (server_socket_fd == -1) {
+    handle_error("socket creation failed");
+  }
+
+  // Allow immediate reuse of the port
+  int opt = 1;
+  if (setsockopt(server_socket_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+    handle_error("setsockopt failed");
+  }
+
+  // Setup non-blocking mode for the socket
+  int flags = fcntl(server_socket_fd, F_GETFL);
+  if (flags == -1 || fcntl(server_socket_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+    handle_error("setting socket to non-blocking mode failed");
+  }
+
+  // Bind socket to port 9000 on any interface
+  struct sockaddr_in server_address = {0};
+  server_address.sin_family = AF_INET;
+  server_address.sin_addr.s_addr = INADDR_ANY;
+  server_address.sin_port = htons(9000);
+  if (bind(server_socket_fd, (struct sockaddr *)&server_address, sizeof(server_address)) < 0) {
+    handle_error("bind failed");
+  }
+
+  // Daemonize if required
+  if (is_daemon) {
+    daemonize(); // You should implement this function to handle the daemonization process as described in the previous code block
+  }
+
+  // Listen for incoming connections
+  if (listen(server_socket_fd, 3) < 0) {
+    handle_error("listen failed");
+  }
+
+  // Initialize logging
+  openlog("ecen-5713", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
+  syslog(LOG_NOTICE, "Program started by User %d", getuid());
+
+  // Initialize the mutex used for file writing
+  pthread_mutex_t writing_output_mutex;
+  pthread_mutex_init(&writing_output_mutex, NULL);
+
+  // Start the timestamping thread
+  pthread_t timestamp_thread_id;
+  Task timestamp_task = {.writing_output_mutex = &writing_output_mutex, .output_file = output_file};
+  pthread_create(&timestamp_thread_id, NULL, timestamp_thread, &timestamp_task);
+
+  // Main loop to accept connections and dispatch worker threads
+  while (keep_running) {
+    struct sockaddr_storage their_addr;
     socklen_t addrlen = sizeof(their_addr);
-    char *buffer;
-    int buffer_size = 1024 * 1024 * 4; // 4MB
-    FILE *output_file;
-    int opt = 1;
-    int flags;
+    int client_socket_fd = accept(server_socket_fd, (struct sockaddr *)&their_addr, &addrlen);
 
-    // Check for the '-d' argument to daemonize
-    if (argc > 1 && strcmp(argv[1], "-d") == 0) {
-        pid_t pid = fork();
-
-        if (pid < 0) return -1; // Fork failed
-        if (pid > 0) exit(EXIT_SUCCESS); // Parent exits
-
-        // Child (daemon) continues
-        setsid(); // Start a new session
+    if (client_socket_fd < 0) {
+      if (errno == EWOULDBLOCK) {
+        sleep(1); // No connection, sleep for a bit
+        continue;
+      } else if (!keep_running) {
+        break; // Exit signal received
+      } else {
+        handle_error("accept failed");
+      }
     }
 
-    // Register improved signal handlers for SIGINT and SIGTERM
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    // Log the accepted connection
+    syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(((struct sockaddr_in *)&their_addr)->sin_addr));
 
-    // Open or create the file where data will be stored
-    output_file = fopen(output_filename, "a+");
-    if (!output_file) {
-        handle_error("Failed to open output file");
-    }
+    // Create and dispatch a worker thread for the new connection
+    pthread_t worker_thread_id;
+    Task *new_task = malloc(sizeof(Task));
+    *new_task = (Task){.client_socket_fd = client_socket_fd, .writing_output_mutex = &writing_output_mutex, .output_file = output_file};
+    pthread_create(&worker_thread_id, NULL, handle_connection, new_task);
+    pthread_detach(worker_thread_id); // The thread cleans up after itself
+  }
 
-    // Create a socket
-    server_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_socket_fd == -1) {
-        handle_error("socket creation failed");
-    }
-
-    // Allow the port to be reused immediately after the program exits
-    if (setsockopt(server_socket_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
-        handle_error("setsockopt failed");
-    }
-
-    // Set socket to non-blocking mode
-    flags = fcntl(server_socket_fd, F_GETFL);
-    if (flags == -1 || fcntl(server_socket_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        handle_error("setting socket to non-blocking failed");
-    }
-
-    // Bind the socket to a port
-    server_address.sin_family = AF_INET;
-    server_address.sin_addr.s_addr = INADDR_ANY; // Automatically fill with my IP
-    server_address.sin_port = htons(9000); // Port number
-    if (bind(server_socket_fd, (struct sockaddr *)&server_address, sizeof(server_address)) < 0) {
-        handle_error("bind failed");
-    }
-
-    // Listen for connections
-    if (listen(server_socket_fd, 3) < 0) {
-        handle_error("listen failed");
-    }
-
-    // Allocate memory for the data buffer
-    buffer = calloc(buffer_size, sizeof(char));
-    if (buffer == NULL) {
-        handle_error("memory allocation failed");
-    }
-
-    // Open syslog for logging
-    openlog("aesdsocket", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
-    syslog(LOG_NOTICE, "Program started by User %d", getuid());
-
-    // Main loop
-    while (keep_running) {
-        printf("Waiting for connections...\n");
-        fflush(stdout);
-
-        // Allocate memory to pass the client socket descriptor to the thread
-        int* client_socket_fd = malloc(sizeof(int));
-        if(client_socket_fd == NULL) {
-            perror("Failed to allocate memory for client socket descriptor");
-            continue;
-        }
-
-        // Accept a connection
-        *client_socket_fd = accept(server_socket_fd, (struct sockaddr *)&their_addr, &addrlen);
-        if (*client_socket_fd < 0) {
-            free(client_socket_fd); // Free the allocated memory if accept fails
-            if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                usleep(100000); // No connection attempts, wait for a bit and retry
-                continue;
-            } else if (!keep_running) {
-                // If a signal to stop was received, break out of the loop
-                break;
-            }
-            perror("accept failed");
-            continue;
-        }
-
-        // Log the accepted connection
-        syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(((struct sockaddr_in*)&their_addr)->sin_addr));
-
-        // Create a new thread for handling the connection
-        pthread_t thread_id;
-        if(pthread_create(&thread_id, NULL, handle_connection, client_socket_fd) != 0) {
-            perror("Failed to create thread for handling connection");
-            close(*client_socket_fd); // Close the client socket as thread creation failed
-            free(client_socket_fd); // Free the allocated memory
-            continue; // Proceed to accept the next connection
-        }
-
-        // Detach the thread - let it run independently and reclaim its resources upon completion
-        pthread_detach(thread_id);
-    }
-
-    // Clean up before exiting
-    printf("Freeing allocated memory and closing file descriptors\n");
-    free(buffer);
-    fclose(output_file);
-    close(server_socket_fd);
-
-    // Delete the file as part of graceful shutdown
-    if(remove(output_filename) == 0) {
-        printf("Deleted the file: %s\n", output_filename);
-    } else {
-        perror("Failed to delete the file");
-    }
-
-    // Closing syslog
-    closelog();
-
-    return 0; 
+  // Cleanup before exiting
+  pthread_join(timestamp_thread_id, NULL); // Ensure the timestamp thread finishes
+  pthread_mutex_destroy(&writing_output_mutex); // Clean up mutex
+  fclose(output_file);
+  close(server_socket_fd);
+  unlink(output_filename); // Remove the output file
+  closelog(); // Close the log
+  return 0;
 }
