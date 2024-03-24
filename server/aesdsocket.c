@@ -59,7 +59,7 @@ void* handle_connection(void* arg) {
 
 int main(int argc, char *argv[]) {
     struct sockaddr_in server_address = {0};
-    int server_socket_fd, client_socket_fd;
+    int server_socket_fd;
     struct sockaddr_storage their_addr; // Connector's address information
     socklen_t addrlen = sizeof(their_addr);
     char *buffer;
