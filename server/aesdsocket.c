@@ -35,7 +35,6 @@ void* handle_connection(void* arg) {
         handle_error("memory allocation failed");
     }
 
-    ssize_t num_read;
     pthread_mutex_lock(&write_mutex);
     FILE *output_file = fopen(output_filename, "a+");
     if (!output_file) {
@@ -45,19 +44,39 @@ void* handle_connection(void* arg) {
         handle_error("Failed to open output file");
     }
 
+    ssize_t num_read;
     while((num_read = read(client_socket_fd, buffer, 1024 * 1024 - 1)) > 0) {
         buffer[num_read] = '\0';
         fputs(buffer, output_file);
         fflush(output_file);
     }
 
-    fclose(output_file);
+    fclose(output_file); // Close the output file after writing
+
+    // Reopen the file to send its content back to the client.
+    FILE* read_file = fopen(output_filename, "r");
+    if (!read_file) {
+        syslog(LOG_ERR, "Failed to open file for reading: %s", output_filename);
+        pthread_mutex_unlock(&write_mutex);
+        close(client_socket_fd);
+        free(buffer);
+        return NULL; // Exit the thread function properly
+    }
+
+    char read_buffer[1024];
+    size_t bytes_read;
+    while ((bytes_read = fread(read_buffer, 1, sizeof(read_buffer), read_file)) > 0) {
+        send(client_socket_fd, read_buffer, bytes_read, 0); // Looping until all bytes are sent is advised
+    }
+
+    fclose(read_file);
     pthread_mutex_unlock(&write_mutex);
 
     close(client_socket_fd);
     free(buffer);
     return NULL;
 }
+
 
 int main(int argc, char *argv[]) {
     struct sockaddr_in server_address = {0};
