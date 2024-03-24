@@ -24,14 +24,17 @@
 int keep_running = 1;
 const char *output_filename = "/var/tmp/aesdsocketdata";
 
+// Mutexes and condition for thread synchronization
 pthread_mutex_t list_mutex;
 pthread_cond_t queue_condition;
 
+// Signal handler to safely shut down the server
 void finish() {
   keep_running = 0;
   syslog(LOG_NOTICE, "Caught signal, exiting");
 }
 
+// Task structure for handling client requests
 typedef struct Task {
   pthread_mutex_t *writing_output_mutex;
   FILE *output_file;
@@ -45,8 +48,10 @@ struct thread {
   SLIST_ENTRY(thread) threads;
 };
 
+// Initialize the head for the thread list
 SLIST_HEAD(head_s, thread) head;
 
+// Function to process client requests
 void execute_task(Task *task) {
   int thread_buffer_size = 10 * 1024 * 1024;
   char *thread_buffer = calloc(thread_buffer_size, sizeof(char));
@@ -54,12 +59,16 @@ void execute_task(Task *task) {
     handle_error("calloc");
   }
 
+  
+  // Read data from client
   ssize_t valread =
       read(task->client_socket_fd, thread_buffer, thread_buffer_size - 1);
   thread_buffer[valread] = 0;
 
+  // Lock the mutex before writing to the shared output file
   pthread_mutex_lock(task->writing_output_mutex);
 
+  // Append received data to the file
   fseek(task->output_file, 0, SEEK_END);
   char *tok = strtok(thread_buffer, "\n");
   while (tok != NULL) {
@@ -67,6 +76,7 @@ void execute_task(Task *task) {
     tok = strtok(NULL, "\n");
   }
 
+  // Determine the file size to reallocate buffer if necessary
   long file_size = ftell(task->output_file);
 
   if (file_size > thread_buffer_size) {
@@ -74,25 +84,31 @@ void execute_task(Task *task) {
     thread_buffer = realloc(thread_buffer, thread_buffer_size);
   }
 
+  // Read the entire file content to send it back to the client
   rewind(task->output_file);
   fread(thread_buffer, file_size, 1, task->output_file);
   thread_buffer[file_size] = 0;
   fseek(task->output_file, 0, SEEK_END);
 
+  // Unlock the mutex after writing is done
   pthread_mutex_unlock(task->writing_output_mutex);
 
+  // Send the updated file content to the client
   send(task->client_socket_fd, thread_buffer, file_size, 0);
+  
+  // Clean up
   close(task->client_socket_fd);
-
   free(thread_buffer);
 }
 
+// Thread function to handle connections
 void *start_thread(void *args) {
   struct thread *th = (struct thread *)args;
   execute_task(&th->task);
   return NULL;
 }
 
+// Thread function for appending timestamp to the file every 10 seconds
 void *timestamp_thread(void *args) {
   Task *task = (Task *)args;
 
@@ -119,6 +135,7 @@ void *timestamp_thread(void *args) {
 int main(int argc, char **argv) {
   int is_daemon = 0;
 
+  // Checks command line args for the daemon mode flag
   for (int i = 1; i < argc; i++) {
     if (strncmp(argv[i], "-d", 2) == 0) {
       is_daemon = 1;
@@ -126,6 +143,7 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Set up signal handlers for graceful shutdown
   signal(SIGINT, finish);
   signal(SIGTERM, finish);
 
@@ -151,6 +169,7 @@ int main(int argc, char **argv) {
     handle_error("socket");
   }
 
+  // Set socket options to reuse the address and port
   int opt = 1;
   if (setsockopt(server_socket_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT,
                  &opt, sizeof(opt))) {
@@ -166,16 +185,19 @@ int main(int argc, char **argv) {
     handle_error("fcntl");
   }
 
+  // Prepare server socket address structure
   struct sockaddr_in server_address;
   server_address.sin_family = AF_INET;
   server_address.sin_addr.s_addr = INADDR_ANY;
   server_address.sin_port = htons(9000);
 
+  // Bind to the server address
   if (bind(server_socket_fd, (struct sockaddr *)&server_address,
            sizeof(server_address)) < 0) {
     handle_error("bind");
   }
 
+  // Daemonize if requested
   if (is_daemon) {
     pid_t pid = fork();
     if (pid < 0) {
@@ -205,18 +227,16 @@ int main(int argc, char **argv) {
     }
     umask(0);
     chdir("/");
-    /* for (int x = sysconf(_SC_OPEN_MAX); x >= 0; x--) { */
-    /*   close(x); */
-    /* } */
   }
 
   if (listen(server_socket_fd, 3) < 0) {
     handle_error("listen");
   }
 
-  openlog("ecen-5713", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
+  openlog("aesdsocket", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
   syslog(LOG_NOTICE, "Program started by User %d", getuid());
 
+  // Initialize thread management
   pthread_t timestamp_thread_id;
   pthread_mutex_t writing_output_mutex;
   int counter = 0;
@@ -227,11 +247,14 @@ int main(int argc, char **argv) {
 
   SLIST_INIT(&head);
 
+  // Start the timestamp appending thread
   Task timestamp_task = {.writing_output_mutex = &writing_output_mutex,
                          .output_file = output_file};
   pthread_create(&timestamp_thread_id, NULL, timestamp_thread, &timestamp_task);
 
   struct thread *e = NULL;
+  
+  // Main server loop for accepting and handling connections
   while (keep_running) {
     int client_socket_fd;
     struct sockaddr_storage their_addr;  // connector's address information
@@ -274,17 +297,17 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&list_mutex);
   }
 
+  // Wait for all threads to complete
   SLIST_FOREACH(e, &head, threads) {
     if (pthread_join(e->id, NULL) != 0) {
       handle_error("pthread_join");
     }
   }
-
   pthread_join(timestamp_thread_id, NULL);
 
+  // Clean up
   pthread_mutex_destroy(&list_mutex);
   pthread_mutex_destroy(&writing_output_mutex);
-
   fclose(output_file);
   close(server_socket_fd);
   unlink(output_filename);
