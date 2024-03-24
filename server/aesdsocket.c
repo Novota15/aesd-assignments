@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
   fclose(output_file);
   
   // Reopen for append
-  FILE *output_file = fopen(output_filename, "a+");
+  output_file = fopen(output_filename, "a+");
 
   struct addrinfo hints;
   memset(&hints, 0, sizeof hints);
