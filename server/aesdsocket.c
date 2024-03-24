@@ -129,6 +129,15 @@ int main(int argc, char **argv) {
   signal(SIGINT, finish);
   signal(SIGTERM, finish);
 
+  // Open or create the file where data will be stored, and immediately clear it
+  FILE *output_file = fopen(output_filename, "w");
+  if (!output_file) {
+      handle_error("Failed to open output file");
+  }
+  // Close the file after clearing it
+  fclose(output_file);
+  
+  // Reopen for append
   FILE *output_file = fopen(output_filename, "a+");
 
   struct addrinfo hints;
