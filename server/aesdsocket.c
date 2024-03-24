@@ -35,22 +35,24 @@ void* handle_connection(void* arg) {
         handle_error("memory allocation failed");
     }
 
+    ssize_t num_read;
+    pthread_mutex_lock(&write_mutex);
     FILE *output_file = fopen(output_filename, "a+");
     if (!output_file) {
+        pthread_mutex_unlock(&write_mutex);
+        free(buffer);
+        close(client_socket_fd);
         handle_error("Failed to open output file");
     }
 
-    ssize_t num_read;
     while((num_read = read(client_socket_fd, buffer, 1024 * 1024 - 1)) > 0) {
         buffer[num_read] = '\0';
-
-        pthread_mutex_lock(&write_mutex);
         fputs(buffer, output_file);
         fflush(output_file);
-        pthread_mutex_unlock(&write_mutex);
     }
 
     fclose(output_file);
+    pthread_mutex_unlock(&write_mutex);
 
     close(client_socket_fd);
     free(buffer);
@@ -134,24 +136,42 @@ int main(int argc, char *argv[]) {
         printf("Waiting for connections...\n");
         fflush(stdout);
 
+        // Allocate memory to pass the client socket descriptor to the thread
         int* client_socket_fd = malloc(sizeof(int));
-        *client_socket_fd = accept(server_socket_fd, (struct sockaddr *)&their_addr, &addrlen);
-        if (*client_socket_fd < 0) {
-            free(client_socket_fd);
-            if (errno == EWOULDBLOCK) {
-                usleep(100000);
-                continue;
-            } else if (!keep_running) {
-                break;
-            }
-            handle_error("accept failed");
+        if(client_socket_fd == NULL) {
+            perror("Failed to allocate memory for client socket descriptor");
+            continue;
         }
 
+        // Accept a connection
+        *client_socket_fd = accept(server_socket_fd, (struct sockaddr *)&their_addr, &addrlen);
+        if (*client_socket_fd < 0) {
+            free(client_socket_fd); // Free the allocated memory if accept fails
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                usleep(100000); // No connection attempts, wait for a bit and retry
+                continue;
+            } else if (!keep_running) {
+                // If a signal to stop was received, break out of the loop
+                break;
+            }
+            perror("accept failed");
+            continue;
+        }
+
+        // Log the accepted connection
+        syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(((struct sockaddr_in*)&their_addr)->sin_addr));
+
+        // Create a new thread for handling the connection
         pthread_t thread_id;
         if(pthread_create(&thread_id, NULL, handle_connection, client_socket_fd) != 0) {
-            handle_error("Failed to create thread");
+            perror("Failed to create thread for handling connection");
+            close(*client_socket_fd); // Close the client socket as thread creation failed
+            free(client_socket_fd); // Free the allocated memory
+            continue; // Proceed to accept the next connection
         }
-        pthread_detach(thread_id); // Threads will clean up themselves.
+
+        // Detach the thread - let it run independently and reclaim its resources upon completion
+        pthread_detach(thread_id);
     }
 
     // Clean up before exiting
