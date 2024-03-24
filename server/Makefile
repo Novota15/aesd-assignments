@@ -1,13 +1,13 @@
-CFLAGS+=-Wall -pthread
-LDFLAGS+=-pthread
+CFLAGS+=-Wall
+LDFLAGS+=-lpthread
 
-# Default rule for building .c files into executables
 %: %.c
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $^ $(CFLAGS) -o $@ $(LDFLAGS)
 
-# Target to build aesdsocket
 all: aesdsocket
 
-# Target to clean up the built program
 clean:
 	rm -f aesdsocket
+
+valgrind: clean all
+	valgrind --error-exitcode=1 --leak-check=full --show-leak-kinds=all --track-origins=yes --errors-for-leak-kinds=definite --verbose --log-file=valgrind-out.txt ./aesdsocket
