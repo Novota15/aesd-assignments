@@ -11,16 +11,50 @@
 #include <sys/types.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #define handle_error(msg) \
   do { perror(msg); exit(EXIT_FAILURE); } while (0)
 
 volatile sig_atomic_t keep_running = 1;
 const char *output_filename = "/var/tmp/aesdsocketdata";
+pthread_mutex_t write_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 
 // Improved signal handler function to gracefully finish execution
 void signal_handler(int sig) {
     keep_running = 0;
+}
+
+void* handle_connection(void* arg) {
+    int client_socket_fd = *((int*)arg);
+    free(arg); // Free the dynamically allocated memory for the file descriptor.
+
+    char *buffer = calloc(1024 * 1024, sizeof(char)); // 1MB buffer.
+    if (buffer == NULL) {
+        handle_error("memory allocation failed");
+    }
+
+    FILE *output_file = fopen(output_filename, "a+");
+    if (!output_file) {
+        handle_error("Failed to open output file");
+    }
+
+    ssize_t num_read;
+    while((num_read = read(client_socket_fd, buffer, 1024 * 1024 - 1)) > 0) {
+        buffer[num_read] = '\0';
+
+        pthread_mutex_lock(&write_mutex);
+        fputs(buffer, output_file);
+        fflush(output_file);
+        pthread_mutex_unlock(&write_mutex);
+    }
+
+    fclose(output_file);
+
+    close(client_socket_fd);
+    free(buffer);
+    return NULL;
 }
 
 int main(int argc, char *argv[]) {
@@ -100,80 +134,25 @@ int main(int argc, char *argv[]) {
         printf("Waiting for connections...\n");
         fflush(stdout);
 
-        // Accept a connection (non-blocking)
-        client_socket_fd = accept(server_socket_fd, (struct sockaddr *)&their_addr, &addrlen);
-        if (client_socket_fd < 0) {
+        int* client_socket_fd = malloc(sizeof(int));
+        *client_socket_fd = accept(server_socket_fd, (struct sockaddr *)&their_addr, &addrlen);
+        if (*client_socket_fd < 0) {
+            free(client_socket_fd);
             if (errno == EWOULDBLOCK) {
-                // No connection attempts, wait and retry
-                usleep(100000); // 0.1 seconds
+                usleep(100000);
                 continue;
             } else if (!keep_running) {
-                // Exit signal received
                 break;
             }
             handle_error("accept failed");
         }
 
-        // Log accepted connection
-        syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(((struct sockaddr_in*)&their_addr)->sin_addr));
-
-        // Initialize a temporary buffer for reading data.
-        char temp_buffer[buffer_size];
-        ssize_t num_read;
-
-        while((num_read = read(client_socket_fd, temp_buffer, sizeof(temp_buffer) - 1)) > 0) {
-            temp_buffer[num_read] = '\0'; // Null-terminate the received chunk.
-            char *token = strtok(temp_buffer, "\n");
-
-            while(token != NULL) {
-                // Process each token/packet.
-                fputs(token, output_file); // Append the packet to the file.
-                fputc('\n', output_file); // Ensure newline is preserved.
-                token = strtok(NULL, "\n"); // Move to the next packet.
-            }
-            fflush(output_file); // Flush after all packets in the buffer are processed.
-
-            // Send the file's content back to the client here, outside the inner loop.
-            rewind(output_file); // Reset to the beginning of the file.
-            while((num_read = fread(buffer, 1, buffer_size - 1, output_file)) > 0) {
-                send(client_socket_fd, buffer, num_read, 0); // Send file content.
-            }
-            rewind(output_file); // Reset for the next operation.
+        pthread_t thread_id;
+        if(pthread_create(&thread_id, NULL, handle_connection, client_socket_fd) != 0) {
+            handle_error("Failed to create thread");
         }
-
-        fclose(output_file); // Close the file to ensure data is flushed
-
-        if(num_read == -1 && errno != EWOULDBLOCK) {
-            perror("read");
-            close(client_socket_fd);
-            continue; // Move to next client or exit if signal received.
-        }
-        
-
-        // Reopen the file for reading before sending its contents
-        output_file = fopen(output_filename, "r");
-        if (!output_file) {
-            handle_error("Failed to open output file for reading");
-        }
-
-        // Send back the file's content to the client
-        fseek(output_file, 0, SEEK_SET); // Ensure we're at the start of the file
-        while((num_read = fread(buffer, 1, buffer_size - 1, output_file)) > 0) {
-            send(client_socket_fd, buffer, num_read, 0);
-        }
-
-        fclose(output_file); // Close the file after sending its content
-
-        // Reopen the file for appending for the next write operation
-        output_file = fopen(output_filename, "a+");
-        if (!output_file) {
-            handle_error("Failed to reopen output file for appending");
-        }
-
-        // Close client socket and log closure
-        close(client_socket_fd);
-        syslog(LOG_INFO, "Closed connection from %s", inet_ntoa(((struct sockaddr_in*)&their_addr)->sin_addr));
-    } // While keep_running loop ends here
+        pthread_detach(thread_id); // Threads will clean up themselves.
+    }
 
     // Clean up before exiting
     printf("Freeing allocated memory and closing file descriptors\n");
