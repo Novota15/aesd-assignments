@@ -15,6 +15,13 @@
 #include <syslog.h>
 #include <unistd.h>
 
+#define USE_AESD_CHAR_DEVICE 1
+#if (USE_AESD_CHAR_DEVICE)
+#define FILE_NAME	"/dev/aesdchar"
+#else
+#define FILE_NAME	"/var/tmp/aesdsocketdata"
+#endif
+
 #define handle_error(msg) \
   do {                    \
     perror(msg);          \
