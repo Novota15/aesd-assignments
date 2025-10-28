@@ -14,6 +14,7 @@
 #include <sys/types.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <time.h>
 
 #define USE_AESD_CHAR_DEVICE 1
 #if (USE_AESD_CHAR_DEVICE)
@@ -29,11 +30,10 @@
   } while (0)
 
 int keep_running = 1;
-const char *output_filename = "/var/tmp/aesdsocketdata";
 
 // Mutexes and condition for thread synchronization
+pthread_mutex_t file_mutex;
 pthread_mutex_t list_mutex;
-pthread_cond_t queue_condition;
 
 // Signal handler to safely shut down the server
 void finish() {
@@ -43,8 +43,6 @@ void finish() {
 
 // Task structure for handling client requests
 typedef struct Task {
-  pthread_mutex_t *writing_output_mutex;
-  FILE *output_file;
   int client_socket_fd;
   int id;
 } Task;
@@ -58,7 +56,112 @@ struct thread {
 // Initialize the head for the thread list
 SLIST_HEAD(head_s, thread) head;
 
-// Function to process client requests
+#if (USE_AESD_CHAR_DEVICE)
+// Function to process client requests for character device
+void execute_task(Task *task) {
+  int buffer_size = 1024;
+  char *read_buffer = malloc(buffer_size);
+  char *write_buffer = malloc(buffer_size);
+  if (read_buffer == NULL || write_buffer == NULL) {
+    handle_error("malloc");
+  }
+
+  int write_pos = 0;
+  ssize_t valread;
+  
+  // Read data from client until we get a newline
+  while ((valread = read(task->client_socket_fd, read_buffer, buffer_size - 1)) > 0) {
+    // Check if we need to expand write buffer
+    if (write_pos + valread >= buffer_size) {
+      buffer_size *= 2;
+      write_buffer = realloc(write_buffer, buffer_size);
+      if (write_buffer == NULL) {
+        handle_error("realloc");
+      }
+    }
+    
+    memcpy(write_buffer + write_pos, read_buffer, valread);
+    write_pos += valread;
+    
+    // Check if we have a newline
+    if (memchr(read_buffer, '\n', valread) != NULL) {
+      break;
+    }
+  }
+
+  if (valread < 0) {
+    perror("read from socket");
+    goto cleanup;
+  }
+
+  // Lock the mutex before accessing the device
+  pthread_mutex_lock(&file_mutex);
+
+  // Open the device, write data, then read it back
+  int fd = open(FILE_NAME, O_RDWR);
+  if (fd < 0) {
+    perror("open device");
+    pthread_mutex_unlock(&file_mutex);
+    goto cleanup;
+  }
+
+  // Write the data to the device
+  ssize_t written = write(fd, write_buffer, write_pos);
+  if (written < 0) {
+    perror("write to device");
+    close(fd);
+    pthread_mutex_unlock(&file_mutex);
+    goto cleanup;
+  }
+
+  // Now read all data from the device to send back to client
+  lseek(fd, 0, SEEK_SET);
+  
+  int total_read = 0;
+  int send_buffer_size = 4096;
+  char *send_buffer = malloc(send_buffer_size);
+  if (send_buffer == NULL) {
+    close(fd);
+    pthread_mutex_unlock(&file_mutex);
+    handle_error("malloc");
+  }
+
+  while (1) {
+    if (total_read + 1024 >= send_buffer_size) {
+      send_buffer_size *= 2;
+      send_buffer = realloc(send_buffer, send_buffer_size);
+      if (send_buffer == NULL) {
+        close(fd);
+        pthread_mutex_unlock(&file_mutex);
+        handle_error("realloc");
+      }
+    }
+    
+    ssize_t bytes_read = read(fd, send_buffer + total_read, 1024);
+    if (bytes_read <= 0) {
+      break;
+    }
+    total_read += bytes_read;
+  }
+
+  close(fd);
+  pthread_mutex_unlock(&file_mutex);
+
+  // Send the data back to the client
+  if (total_read > 0) {
+    send(task->client_socket_fd, send_buffer, total_read, 0);
+  }
+
+  free(send_buffer);
+
+cleanup:
+  close(task->client_socket_fd);
+  free(read_buffer);
+  free(write_buffer);
+}
+
+#else
+// Function to process client requests for file-based storage
 void execute_task(Task *task) {
   int thread_buffer_size = 10 * 1024 * 1024;
   char *thread_buffer = calloc(thread_buffer_size, sizeof(char));
@@ -66,25 +169,30 @@ void execute_task(Task *task) {
     handle_error("calloc");
   }
 
-  
   // Read data from client
   ssize_t valread =
       read(task->client_socket_fd, thread_buffer, thread_buffer_size - 1);
   thread_buffer[valread] = 0;
 
   // Lock the mutex before writing to the shared output file
-  pthread_mutex_lock(task->writing_output_mutex);
+  pthread_mutex_lock(&file_mutex);
+
+  FILE *output_file = fopen(FILE_NAME, "a+");
+  if (!output_file) {
+    pthread_mutex_unlock(&file_mutex);
+    handle_error("Failed to open output file");
+  }
 
   // Append received data to the file
-  fseek(task->output_file, 0, SEEK_END);
+  fseek(output_file, 0, SEEK_END);
   char *tok = strtok(thread_buffer, "\n");
   while (tok != NULL) {
-    fprintf(task->output_file, "%s\n", tok);
+    fprintf(output_file, "%s\n", tok);
     tok = strtok(NULL, "\n");
   }
 
   // Determine the file size to reallocate buffer if necessary
-  long file_size = ftell(task->output_file);
+  long file_size = ftell(output_file);
 
   if (file_size > thread_buffer_size) {
     thread_buffer_size = file_size * 2;
@@ -92,13 +200,14 @@ void execute_task(Task *task) {
   }
 
   // Read the entire file content to send it back to the client
-  rewind(task->output_file);
-  fread(thread_buffer, file_size, 1, task->output_file);
+  rewind(output_file);
+  fread(thread_buffer, file_size, 1, output_file);
   thread_buffer[file_size] = 0;
-  fseek(task->output_file, 0, SEEK_END);
 
+  fclose(output_file);
+  
   // Unlock the mutex after writing is done
-  pthread_mutex_unlock(task->writing_output_mutex);
+  pthread_mutex_unlock(&file_mutex);
 
   // Send the updated file content to the client
   send(task->client_socket_fd, thread_buffer, file_size, 0);
@@ -108,16 +217,9 @@ void execute_task(Task *task) {
   free(thread_buffer);
 }
 
-// Thread function to handle connections
-void *start_thread(void *args) {
-  struct thread *th = (struct thread *)args;
-  execute_task(&th->task);
-  return NULL;
-}
-
 // Thread function for appending timestamp to the file every 10 seconds
 void *timestamp_thread(void *args) {
-  Task *task = (Task *)args;
+  (void)args;  // unused
 
   while (keep_running) {
     for (int i = 0; i < 10 && keep_running == 1; i++) {
@@ -132,10 +234,22 @@ void *timestamp_thread(void *args) {
     tmp = localtime(&t);
     strftime(s, sizeof(s), "%Y-%m-%d %H:%M:%S", tmp);
 
-    pthread_mutex_lock(task->writing_output_mutex);
-    fprintf(task->output_file, "timestamp:%s\n", s);
-    pthread_mutex_unlock(task->writing_output_mutex);
+    pthread_mutex_lock(&file_mutex);
+    FILE *output_file = fopen(FILE_NAME, "a");
+    if (output_file) {
+      fprintf(output_file, "timestamp:%s\n", s);
+      fclose(output_file);
+    }
+    pthread_mutex_unlock(&file_mutex);
   }
+  return NULL;
+}
+#endif
+
+// Thread function to handle connections
+void *start_thread(void *args) {
+  struct thread *th = (struct thread *)args;
+  execute_task(&th->task);
   return NULL;
 }
 
@@ -154,16 +268,14 @@ int main(int argc, char **argv) {
   signal(SIGINT, finish);
   signal(SIGTERM, finish);
 
+#if (!USE_AESD_CHAR_DEVICE)
   // Open or create the file where data will be stored, and immediately clear it
-  FILE *output_file = fopen(output_filename, "w");
+  FILE *output_file = fopen(FILE_NAME, "w");
   if (!output_file) {
       handle_error("Failed to open output file");
   }
-  // Close the file after clearing it
   fclose(output_file);
-  
-  // Reopen for append
-  output_file = fopen(output_filename, "a+");
+#endif
 
   struct addrinfo hints;
   memset(&hints, 0, sizeof hints);
@@ -244,22 +356,19 @@ int main(int argc, char **argv) {
   syslog(LOG_NOTICE, "Program started by User %d", getuid());
 
   // Initialize thread management
-  pthread_t timestamp_thread_id;
-  pthread_mutex_t writing_output_mutex;
-  int counter = 0;
-
-  pthread_mutex_init(&writing_output_mutex, NULL);
+  pthread_mutex_init(&file_mutex, NULL);
   pthread_mutex_init(&list_mutex, NULL);
-  pthread_cond_init(&queue_condition, NULL);
 
   SLIST_INIT(&head);
 
-  // Start the timestamp appending thread
-  Task timestamp_task = {.writing_output_mutex = &writing_output_mutex,
-                         .output_file = output_file};
-  pthread_create(&timestamp_thread_id, NULL, timestamp_thread, &timestamp_task);
+#if (!USE_AESD_CHAR_DEVICE)
+  // Start the timestamp appending thread only for file-based mode
+  pthread_t timestamp_thread_id;
+  pthread_create(&timestamp_thread_id, NULL, timestamp_thread, NULL);
+#endif
 
   struct thread *e = NULL;
+  int counter = 0;
   
   // Main server loop for accepting and handling connections
   while (keep_running) {
@@ -290,9 +399,7 @@ int main(int argc, char **argv) {
       handle_error("malloc");
     }
 
-    Task task = {.writing_output_mutex = &writing_output_mutex,
-                 .client_socket_fd = client_socket_fd,
-                 .output_file = output_file,
+    Task task = {.client_socket_fd = client_socket_fd,
                  .id = counter};
     e->task = task;
 
@@ -310,14 +417,20 @@ int main(int argc, char **argv) {
       handle_error("pthread_join");
     }
   }
+  
+#if (!USE_AESD_CHAR_DEVICE)
   pthread_join(timestamp_thread_id, NULL);
+#endif
 
   // Clean up
   pthread_mutex_destroy(&list_mutex);
-  pthread_mutex_destroy(&writing_output_mutex);
-  fclose(output_file);
+  pthread_mutex_destroy(&file_mutex);
   close(server_socket_fd);
-  unlink(output_filename);
+  
+#if (!USE_AESD_CHAR_DEVICE)
+  unlink(FILE_NAME);
+#endif
+
   closelog();
   return 0;
 }
